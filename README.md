@@ -1,4 +1,4 @@
-# deepseek-harness-retry
+# @syncended/dsh-retry
 
 Автоматический retry временных и generic-ошибок моделей в [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
@@ -20,7 +20,13 @@
 
 ## Установка
 
-Установите пакет в нужный DSH profile:
+Из npm после публикации:
+
+```bash
+dsh plugin --profile web add -w @syncended/dsh-retry
+```
+
+Напрямую из GitHub до первого npm-релиза или для проверки `trunk`:
 
 ```bash
 dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
@@ -95,6 +101,8 @@ pnpm install
 pnpm check
 pnpm pack --dry-run
 ```
+
+Tag-driven npm-публикация описана в [`RELEASING.md`](./RELEASING.md).
 
 Требования: Node.js 20+ и DeepSeek Harness `0.1.0-rc.7` или новее.
 

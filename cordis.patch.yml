@@ -1,3 +1,4 @@
+# @syncended/dsh-retry bundle patch.
 - insert:
     - id: model-error-retry
-      name: deepseek-harness-retry
+      name: "@syncended/dsh-retry"
