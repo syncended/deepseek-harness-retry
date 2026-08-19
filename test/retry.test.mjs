@@ -1,0 +1,304 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+  RETRY_EVENT,
+  RETRY_STARTED_EVENT,
+  apply,
+  isOwnedByProviderPolicy,
+  isRetryable,
+  resolveConfig,
+  retryDelay,
+  retryPolicyKey,
+} from '../dist/index.js'
+
+function createHarness(config = {}, internals = {}) {
+  let listener
+  let cleanup
+  const warnings = []
+  const ctx = {
+    logger: {
+      warn: (...args) => warnings.push(args),
+    },
+    on(event, callback) {
+      assert.equal(event, 'agent/request-error')
+      listener = callback
+      return () => {
+        listener = undefined
+      }
+    },
+    effect(setup) {
+      cleanup = setup()
+    },
+  }
+
+  apply(ctx, config, internals)
+  assert.equal(typeof listener, 'function')
+
+  return {
+    warnings,
+    invoke: (payload, next = async () => undefined) => listener(payload, next),
+    dispose: async () => cleanup?.(),
+  }
+}
+
+function createPayload(overrides = {}) {
+  const events = []
+  const session = {
+    events,
+    append(type, data) {
+      events.push({ type, data })
+    },
+  }
+
+  return {
+    agent: { session },
+    turn: 1,
+    step: 1,
+    provider: 'openai',
+    failure: { code: 'PI_AI_ERROR', message: 'An internal error occurred' },
+    retryPolicy: undefined,
+    signal: new AbortController().signal,
+    ...overrides,
+  }
+}
+
+test('default policy retries generic GPT/pi-ai errors but not auth failures', () => {
+  const config = resolveConfig()
+  assert.equal(isRetryable(config, 'openai', { code: 'PI_AI_ERROR', message: 'internal' }), true)
+  assert.equal(isRetryable(config, 'openai', { code: 'UNKNOWN', message: 'unknown' }), true)
+  assert.equal(isRetryable(config, 'openai', { code: 'AUTH', message: 'bad key' }), false)
+})
+
+test('adapter-owned policies keep precedence over this fallback', () => {
+  const failure = { code: 'PI_AI_ERROR', message: 'internal' }
+  assert.equal(isOwnedByProviderPolicy(undefined, failure), false)
+  assert.equal(isOwnedByProviderPolicy({
+    mode: 'normal',
+    maxRetries: 2,
+    retryableCodes: ['SERVER'],
+    initialDelayMs: 500,
+    maxDelayMs: 10_000,
+    jitterRatio: 0.1,
+  }, failure), false)
+  assert.equal(isOwnedByProviderPolicy({
+    mode: 'normal',
+    maxRetries: 2,
+    retryableCodes: ['PI_AI_ERROR'],
+    initialDelayMs: 500,
+    maxDelayMs: 10_000,
+    jitterRatio: 0.1,
+  }, failure), true)
+  assert.equal(isOwnedByProviderPolicy({
+    mode: 'always',
+    initialDelayMs: 500,
+    maxDelayMs: 10_000,
+    jitterRatio: 0.1,
+  }, failure), true)
+})
+
+test('policy keys are canonical and change with retry behavior', () => {
+  const first = resolveConfig({ retryableCodes: ['UNKNOWN', 'PI_AI_ERROR'] })
+  const reordered = resolveConfig({ retryableCodes: ['PI_AI_ERROR', 'UNKNOWN'] })
+  const changed = resolveConfig({ retryableCodes: ['UNKNOWN'], maxRetries: 3 })
+
+  assert.equal(retryPolicyKey(first), retryPolicyKey(reordered))
+  assert.notEqual(retryPolicyKey(first), retryPolicyKey(changed))
+})
+
+test('provider filters and wildcard codes are respected', () => {
+  const config = resolveConfig({
+    retryableCodes: ['*'],
+    providers: ['openai', 'anthropic'],
+    excludeProviders: ['anthropic'],
+  })
+
+  assert.equal(isRetryable(config, 'openai', { code: 'AUTH', message: 'bad key' }), true)
+  assert.equal(isRetryable(config, 'anthropic', { code: 'SERVER', message: 'down' }), false)
+  assert.equal(isRetryable(config, 'google', { code: 'SERVER', message: 'down' }), false)
+})
+
+test('backoff is exponential, bounded, and honors Retry-After', () => {
+  const config = resolveConfig({ initialDelayMs: 100, maxDelayMs: 250, jitterRatio: 0.2 })
+
+  assert.equal(retryDelay(config, 1, { code: 'SERVER', message: 'down' }, () => 0.5), 100)
+  assert.equal(retryDelay(config, 2, { code: 'SERVER', message: 'down' }, () => 0.5), 200)
+  assert.equal(retryDelay(config, 3, { code: 'SERVER', message: 'down' }, () => 0.5), 250)
+  assert.equal(
+    retryDelay(config, 1, { code: 'RATE_LIMIT', message: 'slow', providerRetryAfterMs: 200 }, () => 0),
+    200,
+  )
+  assert.equal(
+    retryDelay(config, 1, { code: 'RATE_LIMIT', message: 'slow', providerRetryAfterMs: 999 }, () => 0),
+    undefined,
+  )
+  const immediate = resolveConfig({ initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 1 })
+  assert.equal(retryDelay(immediate, 10_000, { code: 'UNKNOWN', message: 'retry' }, () => 1), 0)
+})
+
+test('plugin delegates first, records the retry, waits, and returns retry', async () => {
+  const waits = []
+  const harness = createHarness(
+    { maxRetries: 2, initialDelayMs: 100, maxDelayMs: 100, jitterRatio: 0 },
+    {
+      random: () => 0.5,
+      wait: async (delayMs, signal) => {
+        waits.push({ delayMs, aborted: signal.aborted })
+        return true
+      },
+    },
+  )
+  const payload = createPayload()
+  let delegated = 0
+
+  const result = await harness.invoke(payload, async () => {
+    delegated += 1
+    return undefined
+  })
+
+  assert.deepEqual(result, { kind: 'retry' })
+  assert.equal(delegated, 1)
+  assert.deepEqual(waits, [{ delayMs: 100, aborted: false }])
+  assert.equal(payload.agent.session.events.length, 2)
+  assert.equal(payload.agent.session.events[0].type, RETRY_EVENT)
+  assert.equal(payload.agent.session.events[0].data.retry, 1)
+  assert.equal(payload.agent.session.events[1].type, RETRY_STARTED_EVENT)
+  assert.equal(payload.agent.session.events[1].data.retryId, payload.agent.session.events[0].data.retryId)
+  assert.equal(harness.warnings.length, 1)
+  await harness.dispose()
+})
+
+test('plugin preserves a downstream recovery decision without adding a retry', async () => {
+  let waited = false
+  const harness = createHarness({}, {
+    wait: async () => {
+      waited = true
+      return true
+    },
+  })
+  const payload = createPayload()
+
+  const result = await harness.invoke(payload, async () => ({ kind: 'retry' }))
+
+  assert.deepEqual(result, { kind: 'retry' })
+  assert.equal(waited, false)
+  assert.equal(payload.agent.session.events.length, 0)
+  await harness.dispose()
+})
+
+test('plugin does not extend an adapter-owned retry budget', async () => {
+  let waited = false
+  const harness = createHarness({}, {
+    wait: async () => {
+      waited = true
+      return true
+    },
+  })
+  const payload = createPayload({
+    retryPolicy: {
+      mode: 'normal',
+      maxRetries: 2,
+      retryableCodes: ['PI_AI_ERROR'],
+      initialDelayMs: 500,
+      maxDelayMs: 10_000,
+      jitterRatio: 0.1,
+    },
+  })
+
+  assert.equal(await harness.invoke(payload), undefined)
+  assert.equal(waited, false)
+  assert.equal(payload.agent.session.events.length, 0)
+  await harness.dispose()
+})
+
+test('plugin stops when its retry budget is exhausted', async () => {
+  let waits = 0
+  const harness = createHarness({ maxRetries: 2 }, {
+    wait: async () => {
+      waits += 1
+      return true
+    },
+  })
+  const payload = createPayload()
+
+  assert.deepEqual(await harness.invoke(payload), { kind: 'retry' })
+  assert.deepEqual(await harness.invoke(payload), { kind: 'retry' })
+  assert.equal(await harness.invoke(payload), undefined)
+
+  assert.equal(waits, 2)
+  assert.equal(payload.agent.session.events.length, 4)
+  assert.equal(payload.agent.session.events[2].type, RETRY_EVENT)
+  assert.equal(payload.agent.session.events[2].data.retry, 2)
+  await harness.dispose()
+})
+
+test('aborted turns never schedule a retry', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  const harness = createHarness()
+  const payload = createPayload({ signal: controller.signal })
+
+  const result = await harness.invoke(payload)
+
+  assert.equal(result, undefined)
+  assert.equal(payload.agent.session.events.length, 0)
+  await harness.dispose()
+})
+
+test('turn cancellation interrupts an active backoff', async () => {
+  const controller = new AbortController()
+  const harness = createHarness({ initialDelayMs: 10_000, maxDelayMs: 10_000, jitterRatio: 0 })
+  const payload = createPayload({ signal: controller.signal })
+
+  const pending = harness.invoke(payload)
+  await Promise.resolve()
+  controller.abort()
+
+  assert.equal(await pending, undefined)
+  assert.equal(payload.agent.session.events.length, 1)
+  await harness.dispose()
+})
+
+test('plugin disposal aborts and drains active backoffs', async () => {
+  const harness = createHarness({ initialDelayMs: 10_000, maxDelayMs: 10_000, jitterRatio: 0 })
+  const payload = createPayload()
+
+  const pending = harness.invoke(payload)
+  await Promise.resolve()
+  await harness.dispose()
+
+  assert.equal(await pending, undefined)
+  assert.equal(payload.agent.session.events.length, 1)
+})
+
+test('plugin disposal does not wait for a stuck downstream policy', async () => {
+  const harness = createHarness()
+  const payload = createPayload()
+
+  void harness.invoke(payload, () => new Promise(() => {}))
+  await Promise.resolve()
+  await harness.dispose()
+
+  assert.equal(payload.agent.session.events.length, 0)
+})
+
+test('downstream failures propagate without scheduling a retry', async () => {
+  const harness = createHarness()
+  const payload = createPayload()
+
+  await assert.rejects(
+    harness.invoke(payload, async () => {
+      throw new Error('downstream policy failed')
+    }),
+    /downstream policy failed/,
+  )
+  assert.equal(payload.agent.session.events.length, 0)
+  await harness.dispose()
+})
+
+test('invalid delay relationships fail during plugin activation', () => {
+  assert.throws(
+    () => resolveConfig({ initialDelayMs: 1000, maxDelayMs: 100 }),
+    /maxDelayMs must be between initialDelayMs/,
+  )
+})

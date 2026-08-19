@@ -1,0 +1,3 @@
+- insert:
+    - id: model-error-retry
+      name: deepseek-harness-retry
