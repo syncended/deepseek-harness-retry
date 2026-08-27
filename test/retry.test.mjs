@@ -5,10 +5,12 @@ import {
   RETRY_EVENT,
   RETRY_STARTED_EVENT,
   apply,
+  isOverloadFailure,
   isOwnedByProviderPolicy,
   isRetryable,
   resolveConfig,
   retryDelay,
+  retryLimit,
   retryPolicyKey,
 } from '../dist/index.js'
 
@@ -68,6 +70,24 @@ test('default policy retries generic GPT/pi-ai errors but not auth failures', ()
   assert.equal(isRetryable(config, 'openai', { code: 'PI_AI_ERROR', message: 'internal' }), true)
   assert.equal(isRetryable(config, 'openai', { code: 'UNKNOWN', message: 'unknown' }), true)
   assert.equal(isRetryable(config, 'openai', { code: 'AUTH', message: 'bad key' }), false)
+})
+
+test('explicit Codex overloads get a longer retry window', () => {
+  const config = resolveConfig()
+  const failure = {
+    code: 'PI_AI_ERROR',
+    message: 'Codex error: Our servers are currently overloaded. Please try again later.',
+  }
+
+  assert.equal(isOverloadFailure(failure), true)
+  assert.equal(isOverloadFailure({ code: 'PI_AI_ERROR', message: 'WebSocket error' }), false)
+  assert.equal(isOverloadFailure({ code: 'SERVER', message: 'servers overloaded' }), false)
+  assert.equal(retryLimit(config, failure), 5)
+  assert.equal(retryLimit(config, { code: 'PI_AI_ERROR', message: 'generic' }), 2)
+  assert.equal(retryLimit(resolveConfig({ maxRetries: 0 }), failure), 0)
+  assert.equal(retryDelay(config, 1, failure, () => 0.5), 2_000)
+  assert.equal(retryDelay(config, 2, failure, () => 0.5), 4_000)
+  assert.equal(retryDelay(config, 4, failure, () => 0.5), 10_000)
 })
 
 test('adapter-owned policies keep precedence over this fallback', () => {
@@ -229,6 +249,32 @@ test('plugin stops when its retry budget is exhausted', async () => {
   assert.equal(payload.agent.session.events.length, 4)
   assert.equal(payload.agent.session.events[2].type, RETRY_EVENT)
   assert.equal(payload.agent.session.events[2].data.retry, 2)
+  await harness.dispose()
+})
+
+test('plugin uses the overload-specific retry budget and backoff', async () => {
+  const waits = []
+  const harness = createHarness({}, {
+    random: () => 0.5,
+    wait: async (delayMs) => {
+      waits.push(delayMs)
+      return true
+    },
+  })
+  const payload = createPayload({
+    failure: {
+      code: 'PI_AI_ERROR',
+      message: 'Codex error: Our servers are currently overloaded. Please try again later.',
+    },
+  })
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    assert.deepEqual(await harness.invoke(payload), { kind: 'retry' })
+  }
+  assert.equal(await harness.invoke(payload), undefined)
+  assert.deepEqual(waits, [2_000, 4_000, 8_000, 10_000, 10_000])
+  assert.equal(payload.agent.session.events.length, 10)
+  assert.equal(payload.agent.session.events[8].data.maxRetries, 5)
   await harness.dispose()
 })
 

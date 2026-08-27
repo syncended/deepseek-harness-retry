@@ -11,10 +11,14 @@ export declare const DEFAULT_RETRYABLE_CODES: readonly ["STREAM_CLOSED", "MALFOR
 export interface Config {
     /** Maximum retries after the original failed request. */
     maxRetries?: number;
+    /** Maximum retries for an explicit provider-overload response. */
+    overloadMaxRetries?: number;
     /** Exact provider-neutral failure codes. Use `*` to retry every request failure. */
     retryableCodes?: string[];
     /** First exponential-backoff delay in milliseconds. */
     initialDelayMs?: number;
+    /** First delay for an explicit provider-overload response. */
+    overloadInitialDelayMs?: number;
     /** Maximum local or provider-requested delay in milliseconds. */
     maxDelayMs?: number;
     /** Symmetric random multiplier around each local delay, from 0 to 1. */
@@ -28,8 +32,10 @@ export interface Config {
 }
 export interface ResolvedConfig {
     readonly maxRetries: number;
+    readonly overloadMaxRetries: number;
     readonly retryableCodes: readonly string[];
     readonly initialDelayMs: number;
+    readonly overloadInitialDelayMs: number;
     readonly maxDelayMs: number;
     readonly jitterRatio: number;
     readonly providers: readonly string[];
@@ -51,6 +57,10 @@ export interface RetryInternals {
 export declare function resolveConfig(config?: Config): ResolvedConfig;
 /** Canonical identity for one resolved behavior, used to keep durable budgets isolated across config changes. */
 export declare function retryPolicyKey(config: ResolvedConfig): string;
+/** Whether pi-ai collapsed an explicit provider-overload response into its generic code. */
+export declare function isOverloadFailure(failure: LlmFailure): boolean;
+/** Resolve the retry budget, giving explicit overloads enough time to clear. */
+export declare function retryLimit(config: ResolvedConfig, failure: LlmFailure): number;
 /** Decide whether this plugin owns a provider failure after downstream policies delegate. */
 export declare function isRetryable(config: ResolvedConfig, provider: string, failure: LlmFailure): boolean;
 /** Whether the adapter-owned built-in policy owns this code, regardless of its current finite budget. */

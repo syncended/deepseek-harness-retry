@@ -8,7 +8,8 @@
 
 - обрабатывает generic `PI_AI_ERROR` (частый случай для GPT-маршрутов), `UNKNOWN` и стандартные transient-коды;
 - по умолчанию делает до **2 повторов** после исходного запроса;
-- exponential backoff: 500 ms → 1 s, максимум 10 s;
+- для явного ответа Codex `servers are currently overloaded` делает до **5 повторов** с более длинным backoff;
+- exponential backoff: 500 ms → 1 s, максимум 10 s (для overload начинается с 2 s);
 - jitter предотвращает синхронные повторные запросы;
 - учитывает `Retry-After` провайдера и не повторяет запрос раньше указанного срока;
 - фильтрует retry по provider и failure code;
@@ -44,6 +45,7 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
 - id: model-error-retry
   config:
     maxRetries: 3
+    overloadMaxRetries: 5
     retryableCodes:
       - PI_AI_ERROR
       - UNKNOWN
@@ -54,6 +56,7 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
       - TIMEOUT
       - TRANSPORT
     initialDelayMs: 750
+    overloadInitialDelayMs: 2000
     maxDelayMs: 15000
     jitterRatio: 0.15
     respectRetryAfter: true
@@ -65,9 +68,11 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
 
 | Опция | По умолчанию | Описание |
 |---|---:|---|
-| `maxRetries` | `2` | Число повторов после исходной ошибки; `0` отключает plugin. |
+| `maxRetries` | `2` | Число повторов после обычной исходной ошибки; `0` полностью отключает plugin. |
+| `overloadMaxRetries` | `5` | Число повторов для `PI_AI_ERROR` с явным сообщением об overload. |
 | `retryableCodes` | см. ниже | Точные provider-neutral коды. Значение `*` повторяет любую request error. |
-| `initialDelayMs` | `500` | Начальная задержка exponential backoff. |
+| `initialDelayMs` | `500` | Начальная задержка обычного exponential backoff. |
+| `overloadInitialDelayMs` | `2000` | Начальная задержка для явного provider overload. |
 | `maxDelayMs` | `10000` | Максимальная локальная задержка; больший `Retry-After` оставляет ошибку terminal. |
 | `jitterRatio` | `0.1` | Симметричный jitter от `0` до `1`. |
 | `providers` | `[]` | Allowlist provider routes; пустой список разрешает все. |

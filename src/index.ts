@@ -31,10 +31,14 @@ export const DEFAULT_RETRYABLE_CODES = Object.freeze([
 export interface Config {
   /** Maximum retries after the original failed request. */
   maxRetries?: number
+  /** Maximum retries for an explicit provider-overload response. */
+  overloadMaxRetries?: number
   /** Exact provider-neutral failure codes. Use `*` to retry every request failure. */
   retryableCodes?: string[]
   /** First exponential-backoff delay in milliseconds. */
   initialDelayMs?: number
+  /** First delay for an explicit provider-overload response. */
+  overloadInitialDelayMs?: number
   /** Maximum local or provider-requested delay in milliseconds. */
   maxDelayMs?: number
   /** Symmetric random multiplier around each local delay, from 0 to 1. */
@@ -49,8 +53,10 @@ export interface Config {
 
 export interface ResolvedConfig {
   readonly maxRetries: number
+  readonly overloadMaxRetries: number
   readonly retryableCodes: readonly string[]
   readonly initialDelayMs: number
+  readonly overloadInitialDelayMs: number
   readonly maxDelayMs: number
   readonly jitterRatio: number
   readonly providers: readonly string[]
@@ -60,8 +66,10 @@ export interface ResolvedConfig {
 
 export const Config: z<Config> = z.object({
   maxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
+  overloadMaxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(5),
   retryableCodes: z.array(z.string().min(1)).default([...DEFAULT_RETRYABLE_CODES]),
   initialDelayMs: z.number().min(0).max(MAX_TIMER_DELAY_MS).default(500),
+  overloadInitialDelayMs: z.number().min(0).max(MAX_TIMER_DELAY_MS).default(2_000),
   maxDelayMs: z.number().min(0).max(MAX_TIMER_DELAY_MS).default(10_000),
   jitterRatio: z.number().min(0).max(1).default(0.1),
   providers: z.array(z.string().min(1)).default([]),
@@ -81,8 +89,10 @@ export interface RetryInternals {
 
 const DEFAULT_CONFIG: ResolvedConfig = Object.freeze({
   maxRetries: 2,
+  overloadMaxRetries: 5,
   retryableCodes: DEFAULT_RETRYABLE_CODES,
   initialDelayMs: 500,
+  overloadInitialDelayMs: 2_000,
   maxDelayMs: 10_000,
   jitterRatio: 0.1,
   providers: Object.freeze([]),
@@ -102,8 +112,10 @@ function normalizeProviders(providers: readonly string[]): string[] {
 export function resolveConfig(config: Config = {}): ResolvedConfig {
   const resolved: ResolvedConfig = Object.freeze({
     maxRetries: config.maxRetries ?? DEFAULT_CONFIG.maxRetries,
+    overloadMaxRetries: config.overloadMaxRetries ?? DEFAULT_CONFIG.overloadMaxRetries,
     retryableCodes: Object.freeze(normalizeCodes(config.retryableCodes ?? DEFAULT_CONFIG.retryableCodes)),
     initialDelayMs: config.initialDelayMs ?? DEFAULT_CONFIG.initialDelayMs,
+    overloadInitialDelayMs: config.overloadInitialDelayMs ?? DEFAULT_CONFIG.overloadInitialDelayMs,
     maxDelayMs: config.maxDelayMs ?? DEFAULT_CONFIG.maxDelayMs,
     jitterRatio: config.jitterRatio ?? DEFAULT_CONFIG.jitterRatio,
     providers: Object.freeze(normalizeProviders(config.providers ?? DEFAULT_CONFIG.providers)),
@@ -114,12 +126,24 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   if (!Number.isSafeInteger(resolved.maxRetries) || resolved.maxRetries < 0) {
     throw new Error('deepseek-harness-retry: maxRetries must be a non-negative safe integer')
   }
+  if (!Number.isSafeInteger(resolved.overloadMaxRetries) || resolved.overloadMaxRetries < 0) {
+    throw new Error('deepseek-harness-retry: overloadMaxRetries must be a non-negative safe integer')
+  }
   if (
     !Number.isFinite(resolved.initialDelayMs)
     || resolved.initialDelayMs < 0
     || resolved.initialDelayMs > MAX_TIMER_DELAY_MS
   ) {
     throw new Error(`deepseek-harness-retry: initialDelayMs must be between 0 and ${MAX_TIMER_DELAY_MS}`)
+  }
+  if (
+    !Number.isFinite(resolved.overloadInitialDelayMs)
+    || resolved.overloadInitialDelayMs < 0
+    || resolved.overloadInitialDelayMs > MAX_TIMER_DELAY_MS
+  ) {
+    throw new Error(
+      `deepseek-harness-retry: overloadInitialDelayMs must be between 0 and ${MAX_TIMER_DELAY_MS}`,
+    )
   }
   if (
     !Number.isFinite(resolved.maxDelayMs)
@@ -143,10 +167,12 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
 /** Canonical identity for one resolved behavior, used to keep durable budgets isolated across config changes. */
 export function retryPolicyKey(config: ResolvedConfig): string {
   return JSON.stringify([
-    'deepseek-harness-retry/v1',
+    'deepseek-harness-retry/v2',
     config.maxRetries,
+    config.overloadMaxRetries,
     [...config.retryableCodes].sort(),
     config.initialDelayMs,
+    config.overloadInitialDelayMs,
     config.maxDelayMs,
     config.jitterRatio,
     [...config.providers].sort(),
@@ -155,9 +181,21 @@ export function retryPolicyKey(config: ResolvedConfig): string {
   ])
 }
 
+/** Whether pi-ai collapsed an explicit provider-overload response into its generic code. */
+export function isOverloadFailure(failure: LlmFailure): boolean {
+  return failure.code.trim().toUpperCase() === 'PI_AI_ERROR'
+    && /\boverload(?:ed|ing)?\b/i.test(failure.message)
+}
+
+/** Resolve the retry budget, giving explicit overloads enough time to clear. */
+export function retryLimit(config: ResolvedConfig, failure: LlmFailure): number {
+  if (config.maxRetries === 0) return 0
+  return isOverloadFailure(failure) ? config.overloadMaxRetries : config.maxRetries
+}
+
 /** Decide whether this plugin owns a provider failure after downstream policies delegate. */
 export function isRetryable(config: ResolvedConfig, provider: string, failure: LlmFailure): boolean {
-  if (config.maxRetries === 0 || config.excludeProviders.includes(provider)) return false
+  if (retryLimit(config, failure) === 0 || config.excludeProviders.includes(provider)) return false
   if (config.providers.length > 0 && !config.providers.includes(provider)) return false
   const code = failure.code.trim().toUpperCase()
   return config.retryableCodes.includes('*') || config.retryableCodes.includes(code)
@@ -192,10 +230,13 @@ export function retryDelay(
       : undefined
   }
 
+  const initialDelayMs = isOverloadFailure(failure)
+    ? config.overloadInitialDelayMs
+    : config.initialDelayMs
   const exponent = Math.min(Math.max(attempt - 1, 0), 1024)
-  const exponential = config.initialDelayMs === 0
+  const exponential = initialDelayMs === 0
     ? 0
-    : Math.min(config.initialDelayMs * 2 ** exponent, config.maxDelayMs)
+    : Math.min(initialDelayMs * 2 ** exponent, config.maxDelayMs)
   const sample = Math.min(Math.max(random(), 0), 1)
   const multiplier = 1 - config.jitterRatio + 2 * config.jitterRatio * sample
   return Math.min(exponential * multiplier, config.maxDelayMs)
@@ -281,7 +322,8 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
       policyKey,
     )
     const attempt = (previous?.retry ?? 0) + 1
-    if (attempt > resolved.maxRetries) return undefined
+    const maxRetries = retryLimit(resolved, payload.failure)
+    if (attempt > maxRetries) return undefined
 
     const delayMs = retryDelay(resolved, attempt, payload.failure, random)
     if (delayMs === undefined) return undefined
@@ -295,7 +337,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
       mode: 'normal',
       policyKey,
       retry: attempt,
-      maxRetries: resolved.maxRetries,
+      maxRetries,
       delayMs,
       failure: payload.failure,
     }
@@ -305,7 +347,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
       payload.provider,
       delayMs,
       attempt,
-      resolved.maxRetries,
+      maxRetries,
       payload.failure.code,
       payload.failure.message,
     )
