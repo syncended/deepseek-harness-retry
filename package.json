@@ -1,6 +1,6 @@
 {
   "name": "@syncended/dsh-retry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Configurable automatic retries for transient and generic model failures in DeepSeek Harness",
   "type": "module",
   "main": "dist/index.js",
