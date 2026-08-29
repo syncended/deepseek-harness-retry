@@ -14,8 +14,8 @@
 - учитывает `Retry-After` провайдера и не повторяет запрос раньше указанного срока;
 - фильтрует retry по provider и failure code;
 - корректно прекращает ожидание при cancel/dispose;
-- после crash/restart продолжает только подтверждённый durable intent: собственный `llm/retry`, для которого ещё нет `llm/retry-started`;
-- никогда не продолжает завершённый, generic-interrupted, чужой или уже начатый retry turn;
+- после crash/restart продолжает только доказанно незавершённую работу: unmatched собственный `llm/retry` либо последний model step без `assistant/message`;
+- никогда не продолжает завершённый ответ, ручной `aborted/user`, чужой или уже начатый retry turn;
 - не изменяет существующий durable inbox и не перехватывает пользовательский cancel;
 - сначала делегирует встроенным recovery-плагинам DSH, поэтому не перехватывает compaction и другие специализированные политики;
 - записывает стандартные non-surface события `llm/retry` и `llm/retry-started`, совместимые с persistence и Web UI DSH.
@@ -67,11 +67,11 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
     resumeDisposed: false
     resumeMaxAgeMs: 86400000
     resumePrompt: >-
-      The previous model request failed and this plugin scheduled a retry, but DeepSeek
-      Harness stopped before that retry started. Continue the unfinished response from
-      the durable session history. Re-check the current workspace and external state
-      before acting. Do not blindly repeat tool calls that may have side effects; verify
-      their outcome first.
+      DeepSeek Harness stopped before the previous model request produced a complete
+      assistant message, or before a scheduled retry started. Continue the unfinished
+      response from the durable session history. Re-check the current workspace and
+      external state before acting. Do not blindly repeat tool calls that may have side
+      effects; verify their outcome first.
     providers:
       - openai
       - openrouter
@@ -90,7 +90,7 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
 | `providers` | `[]` | Allowlist provider routes; пустой список разрешает все. |
 | `excludeProviders` | `[]` | Denylist provider routes; имеет приоритет над allowlist. |
 | `respectRetryAfter` | `true` | Использовать provider `Retry-After`; не retry, если он выше `maxDelayMs`. |
-| `resumeInterrupted` | `true` | При cold resume продолжать только unmatched `llm/retry`, созданный этим плагином в crash-interrupted turn. |
+| `resumeInterrupted` | `true` | При cold resume продолжать unmatched собственный `llm/retry` либо crash-interrupted model step без `assistant/message`. |
 | `resumeDisposed` | `false` | Также считать `aborted/disposed` допустимым завершением pending retry. Отключено, потому что disposed бывает при HMR и намеренном teardown. |
 | `resumeMaxAgeMs` | `86400000` | Максимальный возраст pending retry для автопродолжения; по умолчанию 24 часа. |
 | `resumePrompt` | см. пример | Model-visible инструкция для безопасного продолжения подтверждённого retry intent. |
@@ -119,8 +119,8 @@ Permanent failures (`AUTH`, `INVALID_REQUEST`, `MISSING_CREDENTIAL`, `UNKNOWN_MO
 
 1. После `llm/retry` плагин запрашивает persistence checkpoint перед backoff. Если checkpoint недоступен, live retry продолжается, но restart recovery для этой попытки считается best-effort.
 2. При crash persistence DSH балансирует открытый tail синтетическими tool errors, `step/end` и `turn/end` с причиной `interrupted`.
-3. Когда Web/API снова присоединяет холодную сессию через `agents.resume`, плагин ищет в последнем turn собственный `llm/retry` без соответствующего `llm/retry-started`.
-4. Завершённый turn, generic interruption без retry marker, чужой policy key, уже начатая попытка, subagent и существующая inbox-очередь немедленно отбрасываются. `aborted/disposed` по умолчанию также не подходит.
+3. Когда Web/API снова присоединяет холодную сессию через `agents.resume`, плагин принимает один из двух durable proofs: собственный `llm/retry` без `llm/retry-started` либо последний crash-interrupted step, в котором есть durable user input, но нет `assistant/message`.
+4. Завершённый `assistant/message`, ручной interrupt (`aborted/user`, включая partial message с `interrupted: true`), чужой policy key, уже начатая попытка, subagent и существующая inbox-очередь немедленно отбрасываются. `aborted/disposed` по умолчанию также не подходит.
 5. Решение и enqueue выполняются внутри `agent.runMaintenance()`, с повторной проверкой exact live Agent. Существующий inbox никогда не удаляется и не переупорядочивается.
 6. Только при пустом inbox добавляется один model-visible plugin notice с детерминированным message id; он открывает новый turn поверх сохранённой истории.
 

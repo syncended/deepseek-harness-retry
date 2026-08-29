@@ -56,7 +56,7 @@ export interface ResolvedConfig {
     readonly resumeMaxAgeMs: number;
     readonly resumePrompt: string;
 }
-export declare const DEFAULT_RESUME_PROMPT = "The previous model request failed and this plugin scheduled a retry, but DeepSeek Harness stopped before that retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.";
+export declare const DEFAULT_RESUME_PROMPT = "DeepSeek Harness stopped before the previous model request produced a complete assistant message, or before a scheduled retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.";
 export declare const Config: z<Config>;
 /** Standard DSH retry event shape used by the built-in Web projection and persistence catalog. */
 export type RetryScheduledEventData = Extract<LlmRetryEventData, {
@@ -96,11 +96,24 @@ export interface PendingRetryContinuation {
     readonly time: number;
     readonly kind: 'interrupted' | 'disposed';
 }
+export interface IncompleteRequestContinuation {
+    readonly turn: number;
+    readonly step: number;
+    readonly time: number;
+    readonly kind: 'incomplete-request';
+}
+export type InterruptedContinuation = PendingRetryContinuation | IncompleteRequestContinuation;
 /** Find an unmatched retry owned by this plugin in the latest non-terminal turn. */
 export declare function pendingRetryContinuation(events: readonly SessionEvent[], includeDisposed?: boolean): PendingRetryContinuation | undefined;
-/** Stable identity for the one continuation justified by a durable pending retry. */
-export declare function interruptedResumeMessageId(sessionId: SessionId, continuation: Pick<PendingRetryContinuation, 'retryId' | 'retry'>): MessageId;
-/** Queue only a plugin-owned pending retry; existing inbox work is never mutated or duplicated. */
+/**
+ * Find a crash-interrupted model request that never committed an assistant message.
+ * A manual interrupt is excluded twice: its turn ends as aborted/user and DSH records
+ * a partial assistant/message with interrupted=true.
+ */
+export declare function incompleteRequestContinuation(events: readonly SessionEvent[]): IncompleteRequestContinuation | undefined;
+/** Stable identity for the one continuation justified by durable interruption evidence. */
+export declare function interruptedResumeMessageId(sessionId: SessionId, continuation: InterruptedContinuation): MessageId;
+/** Queue only work proven unfinished; existing inbox work is never mutated or duplicated. */
 export declare function resumeInterruptedAgent(agent: Agent, config: ResolvedConfig, now?: number): boolean;
 /** Install automatic request-error recovery and interrupted-session continuation. */
 export declare function apply(ctx: Context, config?: Config, internals?: RetryInternals): void;

@@ -17,7 +17,7 @@ export const DEFAULT_RETRYABLE_CODES = Object.freeze([
     'PROVIDER_ERROR',
     'UNKNOWN',
 ]);
-export const DEFAULT_RESUME_PROMPT = 'The previous model request failed and this plugin scheduled a retry, but DeepSeek Harness stopped before that retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.';
+export const DEFAULT_RESUME_PROMPT = 'DeepSeek Harness stopped before the previous model request produced a complete assistant message, or before a scheduled retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.';
 export const Config = z.object({
     maxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
     overloadMaxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(5),
@@ -273,12 +273,71 @@ export function pendingRetryContinuation(events, includeDisposed = false) {
     }
     return undefined;
 }
-/** Stable identity for the one continuation justified by a durable pending retry. */
+/**
+ * Find a crash-interrupted model request that never committed an assistant message.
+ * A manual interrupt is excluded twice: its turn ends as aborted/user and DSH records
+ * a partial assistant/message with interrupted=true.
+ */
+export function incompleteRequestContinuation(events) {
+    let endIndex = -1;
+    let turn = -1;
+    let time = 0;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index];
+        if (event.type !== 'turn/end')
+            continue;
+        if (event.data.reason.kind !== 'interrupted')
+            return undefined;
+        endIndex = index;
+        turn = event.data.turn;
+        time = event.time;
+        break;
+    }
+    if (endIndex < 0)
+        return undefined;
+    let turnStart = -1;
+    for (let index = endIndex - 1; index >= 0; index -= 1) {
+        const event = events[index];
+        if (event.type === 'turn/start' && event.data.turn === turn) {
+            turnStart = index;
+            break;
+        }
+    }
+    if (turnStart < 0)
+        return undefined;
+    let step;
+    let hasDurableUserInput = false;
+    let hasAssistantMessage = false;
+    for (let index = turnStart + 1; index < endIndex; index += 1) {
+        const event = events[index];
+        if (event.type === 'user/message')
+            hasDurableUserInput = true;
+        if (event.type === 'step/start' && event.data.turn === turn) {
+            step = event.data.step;
+            hasAssistantMessage = false;
+            continue;
+        }
+        if (step !== undefined
+            && event.type === 'assistant/message'
+            && event.data.turn === turn
+            && event.data.step === step)
+            hasAssistantMessage = true;
+    }
+    if (step === undefined || !hasDurableUserInput || hasAssistantMessage)
+        return undefined;
+    return { turn, step, time, kind: 'incomplete-request' };
+}
+/** Stable identity for the one continuation justified by durable interruption evidence. */
 export function interruptedResumeMessageId(sessionId, continuation) {
-    return MessageId(`deepseek-harness-retry:resume:${sessionId}:${continuation.retryId}:${continuation.retry}`);
+    const suffix = 'retryId' in continuation
+        ? `retry:${continuation.retryId}:${continuation.retry}`
+        : `request:${continuation.turn}:${continuation.step}`;
+    return MessageId(`deepseek-harness-retry:resume:${sessionId}:${suffix}`);
 }
 function createInterruptedResumeMessage(sessionId, continuation, prompt) {
-    const summary = `Continuing pending retry ${continuation.retry} after DSH restart.`;
+    const summary = 'retryId' in continuation
+        ? `Continuing pending retry ${continuation.retry} after DSH restart.`
+        : `Continuing incomplete request from turn ${continuation.turn} after DSH restart.`;
     return freezeMessage({
         id: interruptedResumeMessageId(sessionId, continuation),
         role: 'user',
@@ -291,13 +350,14 @@ function createInterruptedResumeMessage(sessionId, continuation, prompt) {
         },
     });
 }
-/** Queue only a plugin-owned pending retry; existing inbox work is never mutated or duplicated. */
+/** Queue only work proven unfinished; existing inbox work is never mutated or duplicated. */
 export function resumeInterruptedAgent(agent, config, now = Date.now()) {
     if (!config.resumeInterrupted
         || agent.session.header.origin === 'subagent'
         || agent.inbox.hasPending)
         return false;
-    const continuation = pendingRetryContinuation(agent.session.events, config.resumeDisposed);
+    const continuation = pendingRetryContinuation(agent.session.events, config.resumeDisposed)
+        ?? incompleteRequestContinuation(agent.session.events);
     if (continuation === undefined)
         return false;
     if (now - continuation.time > config.resumeMaxAgeMs)
@@ -419,7 +479,7 @@ export function apply(ctx, config = {}, internals = {}) {
                     catch (error) {
                         ctx.logger.warn('deepseek-harness-retry: could not checkpoint continuation for session "%s": %s', agent.id, String(error));
                     }
-                    ctx.logger.warn('deepseek-harness-retry: continuing pending retry in session "%s"', agent.id);
+                    ctx.logger.warn('deepseek-harness-retry: continuing proven unfinished work in session "%s"', agent.id);
                 });
                 void track(maintenance).catch((error) => {
                     if (lifetime.signal.aborted)

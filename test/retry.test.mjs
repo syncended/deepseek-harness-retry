@@ -7,6 +7,7 @@ import {
   RETRY_EVENT,
   RETRY_STARTED_EVENT,
   apply,
+  incompleteRequestContinuation,
   interruptedResumeMessageId,
   isOverloadFailure,
   isOwnedByProviderPolicy,
@@ -94,6 +95,47 @@ function pendingRetryEvents({
   if (started) {
     events.push(event(RETRY_STARTED_EVENT, { retryId, turn: 1, step: 1, retry: 1 }, 2))
   }
+  events.push(event('turn/end', { turn: 1, reason }, events.length))
+  return events
+}
+
+function incompleteRequestEvents({
+  reason = { kind: 'interrupted' },
+  assistantMessage = false,
+  interruptedMessage = false,
+  includeUser = true,
+} = {}) {
+  const events = [
+    event('turn/start', { turn: 1 }, 0),
+    event('step/start', { turn: 1, step: 1 }, 1),
+  ]
+  if (includeUser) {
+    events.push(event('user/message', {
+      id: 'user-1',
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: 'continue the task' }],
+    }, events.length))
+  }
+  events.push(event('assistant/chunk', {
+    turn: 1,
+    step: 1,
+    chunk: { type: 'text-delta', index: 0, text: 'partial' },
+  }, events.length))
+  if (assistantMessage) {
+    events.push(event('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'assistant-1',
+        role: 'assistant',
+        source: { kind: 'model', provider: 'openai', model: 'test' },
+        content: [{ type: 'text', text: 'partial or complete' }],
+      },
+      ...(interruptedMessage ? { interrupted: true } : {}),
+    }, events.length))
+  }
+  events.push(event('step/end', { turn: 1, step: 1 }, events.length))
   events.push(event('turn/end', { turn: 1, reason }, events.length))
   return events
 }
@@ -499,6 +541,29 @@ test('finished, started, foreign, and generic interrupted turns never auto-resum
   ]), undefined)
 })
 
+test('crash-interrupted request without an assistant message is proven unfinished', () => {
+  assert.deepEqual(incompleteRequestContinuation(incompleteRequestEvents()), {
+    turn: 1,
+    step: 1,
+    time: 1_000,
+    kind: 'incomplete-request',
+  })
+})
+
+test('completed and manually interrupted assistant messages never auto-resume', () => {
+  assert.equal(incompleteRequestContinuation(incompleteRequestEvents({
+    assistantMessage: true,
+  })), undefined)
+  assert.equal(incompleteRequestContinuation(incompleteRequestEvents({
+    reason: { kind: 'aborted', reason: { kind: 'user' } },
+    assistantMessage: true,
+    interruptedMessage: true,
+  })), undefined)
+  assert.equal(incompleteRequestContinuation(incompleteRequestEvents({
+    includeUser: false,
+  })), undefined)
+})
+
 test('disposed retries require a separate explicit opt-in', () => {
   const events = pendingRetryEvents({
     reason: { kind: 'aborted', reason: { kind: 'disposed' } },
@@ -527,6 +592,20 @@ test('a pending plugin retry gets at most one model-visible continuation', () =>
   assert.equal(resumeInterruptedAgent(agent, config, 1_000), false)
   assert.equal(followed.length, 1)
   assert.equal(agent.inbox.nextTurn.length, 1)
+})
+
+test('a crash-interrupted incomplete request gets one continuation', () => {
+  const { agent, followed } = createResumeAgent({ events: incompleteRequestEvents() })
+  const continuation = incompleteRequestContinuation(agent.session.events)
+
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), true)
+  assert.equal(followed.length, 1)
+  assert.equal(followed[0].id, interruptedResumeMessageId(agent.id, continuation))
+  assert.equal(
+    followed[0].source.summary,
+    'Continuing incomplete request from turn 1 after DSH restart.',
+  )
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), false)
 })
 
 test('existing durable inbox work is left untouched and never used as a wake hack', () => {
@@ -576,7 +655,7 @@ test('session-start continuation is fenced by deferred maintenance and exact liv
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(resumed.maintenanceCalls.length, 1)
   assert.equal(resumed.followed.length, 1)
-  assert.equal(harness.warnings.at(-1)[0], 'deepseek-harness-retry: continuing pending retry in session "%s"')
+  assert.equal(harness.warnings.at(-1)[0], 'deepseek-harness-retry: continuing proven unfinished work in session "%s"')
 
   const busy = createResumeAgent({ id: 'busy-session' })
   harness.start(busy.agent, 'resume')
