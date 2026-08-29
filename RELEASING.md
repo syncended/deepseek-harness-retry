@@ -1,51 +1,41 @@
 # Releasing
 
-Releases follow the same tag-driven npm publication flow as `@syncended/dsh-pip`.
+Releases use tag-driven npm publication with provenance.
 
 ## One-time setup
 
-1. **Register on npm** — https://www.npmjs.com/signup
-2. **Create a Granular Access Token that bypasses 2FA** — https://www.npmjs.com/settings/syncended/tokens → Generate New Token → **Granular Access Token**:
-   - Permissions: **Packages and scopes** → **Read and write**, for scope `@syncended` or package `@syncended/dsh-retry`.
-   - **Two-factor authentication: Bypass two-factor authentication** — required for token-based CI publication when the account has 2FA enabled.
-   - A classic **Automation** token also works, but granular + bypass is preferred.
-3. **Add the token to GitHub Actions secrets** — repository → Settings → Secrets and variables → Actions → New repository secret:
-   - Name: `NPM_REGISTRY_TOKEN`
-   - Value: the npm token from step 2.
+1. Create an npm granular access token for `@syncended/dsh-retry` with package read/write access and CI-compatible 2FA bypass.
+2. Store it in the GitHub Actions repository secret `NPM_REGISTRY_TOKEN`.
+3. Confirm the release workflow has npm provenance permissions.
+
+Manage tokens at <https://www.npmjs.com/settings/syncended/tokens>.
 
 ## Every release
 
-Start from a clean `trunk` branch with all checks passing:
+Start from a clean `trunk` branch and run:
 
 ```bash
 pnpm check
 npm pack --dry-run
 ```
 
-For the first `0.1.0` publication, the package is already at that version. Tag the checked release commit directly:
+Create and push a version commit and matching `v<version>` tag:
 
 ```bash
-git tag -a v0.1.0 -m "0.1.0"
-git push origin v0.1.0
-```
-
-For later releases, bump, commit, tag, and push:
-
-```bash
-npm version patch   # or minor, major, or an explicit version such as 0.2.0
+npm version patch   # or minor, major, or an explicit version
 git push --follow-tags
 ```
 
-`npm version` creates a `v<version>` Git tag. The `.github/workflows/release.yml` workflow verifies that the tag matches `package.json`, installs the frozen dependency graph, runs checks/tests, verifies generated `dist`, checks package contents, and publishes with npm provenance.
+The release workflow verifies the tag/version match, installs the frozen dependency graph, reruns tests, verifies generated `dist`, checks package contents, and publishes with npm provenance.
 
-Package page:
+Package page: <https://www.npmjs.com/package/@syncended/dsh-retry>
 
-https://www.npmjs.com/package/@syncended/dsh-retry
-
-After publication, users install with:
+Verify installation in a disposable profile:
 
 ```bash
-dsh plugin --profile web add -w @syncended/dsh-retry
+dsh plugin --profile web add @syncended/dsh-retry
+# Use -w if the pnpm-backed profile requires workspace-root installation.
+dsh web --no-open
 ```
 
-Restart `dsh --profile web` after installation.
+Trigger a controlled retryable failure and confirm `llm/retry` / `llm/retry-started` session events appear.
