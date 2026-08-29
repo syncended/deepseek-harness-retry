@@ -14,6 +14,9 @@
 - учитывает `Retry-After` провайдера и не повторяет запрос раньше указанного срока;
 - фильтрует retry по provider и failure code;
 - корректно прекращает ожидание при cancel/dispose;
+- после crash/restart продолжает только подтверждённый durable intent: собственный `llm/retry`, для которого ещё нет `llm/retry-started`;
+- никогда не продолжает завершённый, generic-interrupted, чужой или уже начатый retry turn;
+- не изменяет существующий durable inbox и не перехватывает пользовательский cancel;
 - сначала делегирует встроенным recovery-плагинам DSH, поэтому не перехватывает compaction и другие специализированные политики;
 - записывает стандартные non-surface события `llm/retry` и `llm/retry-started`, совместимые с persistence и Web UI DSH.
 
@@ -60,6 +63,15 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
     maxDelayMs: 15000
     jitterRatio: 0.15
     respectRetryAfter: true
+    resumeInterrupted: true
+    resumeDisposed: false
+    resumeMaxAgeMs: 86400000
+    resumePrompt: >-
+      The previous model request failed and this plugin scheduled a retry, but DeepSeek
+      Harness stopped before that retry started. Continue the unfinished response from
+      the durable session history. Re-check the current workspace and external state
+      before acting. Do not blindly repeat tool calls that may have side effects; verify
+      their outcome first.
     providers:
       - openai
       - openrouter
@@ -68,7 +80,7 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
 
 | Опция | По умолчанию | Описание |
 |---|---:|---|
-| `maxRetries` | `2` | Число повторов после обычной исходной ошибки; `0` полностью отключает plugin. |
+| `maxRetries` | `2` | Число повторов после обычной исходной ошибки; `0` отключает request-error retry, но не `resumeInterrupted`. |
 | `overloadMaxRetries` | `5` | Число повторов для `PI_AI_ERROR` с явным сообщением об overload. |
 | `retryableCodes` | см. ниже | Точные provider-neutral коды. Значение `*` повторяет любую request error. |
 | `initialDelayMs` | `500` | Начальная задержка обычного exponential backoff. |
@@ -78,6 +90,10 @@ dsh plugin --profile web add -w github:syncended/deepseek-harness-retry
 | `providers` | `[]` | Allowlist provider routes; пустой список разрешает все. |
 | `excludeProviders` | `[]` | Denylist provider routes; имеет приоритет над allowlist. |
 | `respectRetryAfter` | `true` | Использовать provider `Retry-After`; не retry, если он выше `maxDelayMs`. |
+| `resumeInterrupted` | `true` | При cold resume продолжать только unmatched `llm/retry`, созданный этим плагином в crash-interrupted turn. |
+| `resumeDisposed` | `false` | Также считать `aborted/disposed` допустимым завершением pending retry. Отключено, потому что disposed бывает при HMR и намеренном teardown. |
+| `resumeMaxAgeMs` | `86400000` | Максимальный возраст pending retry для автопродолжения; по умолчанию 24 часа. |
+| `resumePrompt` | см. пример | Model-visible инструкция для безопасного продолжения подтверждённого retry intent. |
 
 Default retryable codes:
 
@@ -99,17 +115,28 @@ Permanent failures (`AUTH`, `INVALID_REQUEST`, `MISSING_CREDENTIAL`, `UNKNOWN_MO
 
 Частично полученные chunks не попадают в следующий model-visible request: retry происходит на закрытой request-error границе agent loop.
 
+### Восстановление после рестарта DSH
+
+1. После `llm/retry` плагин запрашивает persistence checkpoint перед backoff. Если checkpoint недоступен, live retry продолжается, но restart recovery для этой попытки считается best-effort.
+2. При crash persistence DSH балансирует открытый tail синтетическими tool errors, `step/end` и `turn/end` с причиной `interrupted`.
+3. Когда Web/API снова присоединяет холодную сессию через `agents.resume`, плагин ищет в последнем turn собственный `llm/retry` без соответствующего `llm/retry-started`.
+4. Завершённый turn, generic interruption без retry marker, чужой policy key, уже начатая попытка, subagent и существующая inbox-очередь немедленно отбрасываются. `aborted/disposed` по умолчанию также не подходит.
+5. Решение и enqueue выполняются внутри `agent.runMaintenance()`, с повторной проверкой exact live Agent. Существующий inbox никогда не удаляется и не переупорядочивается.
+6. Только при пустом inbox добавляется один model-visible plugin notice с детерминированным message id; он открывает новый turn поверх сохранённой истории.
+
+Провайдерский stream и старый JS Promise после перезапуска восстановить невозможно, поэтому это семантическое продолжение новым turn, а не продолжение тех же байтов request. Плагин не сканирует и не запускает архивные сессии при старте DSH — проверка происходит лениво при следующем подключении. Главный fail-closed инвариант: при неоднозначности работа не запускается автоматически.
+
 ## Разработка
 
 ```bash
 pnpm install
 pnpm check
-pnpm pack --dry-run
+npm pack --dry-run
 ```
 
 Tag-driven npm-публикация описана в [`RELEASING.md`](./RELEASING.md).
 
-Требования: Node.js 20+ и DeepSeek Harness `0.1.0-rc.7` или новее.
+Требования: Node.js 20+ и DeepSeek Harness линии `0.1.0-rc.7+` или `0.1.1-rc.2+`.
 
 ## License
 

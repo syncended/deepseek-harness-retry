@@ -1,6 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis';
-import type { LlmFailure, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm';
-import type { LlmRetryEventData } from '@deepseek-ai/dsh-llm-retry/types';
+import type { Agent } from '@deepseek-ai/dsh-agent';
+import { MessageId, type LlmFailure, type ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm';
+import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session';
+import type { LlmRetryEventData, RetryId } from '@deepseek-ai/dsh-llm-retry/types';
 import z from '@deepseek-ai/schemastery';
 export declare const name = "deepseek-harness-retry";
 export declare const inject: string[];
@@ -29,6 +31,14 @@ export interface Config {
     excludeProviders?: string[];
     /** Honor a valid provider Retry-After value, capped by maxDelayMs. */
     respectRetryAfter?: boolean;
+    /** Continue only an unmatched retry scheduled by this plugin after crash repair. */
+    resumeInterrupted?: boolean;
+    /** Also continue an unmatched retry after an intentional lifecycle disposal. */
+    resumeDisposed?: boolean;
+    /** Refuse automatic continuation when the pending retry is older than this many milliseconds. */
+    resumeMaxAgeMs?: number;
+    /** Model-visible instruction used to continue a crash-interrupted turn. */
+    resumePrompt?: string;
 }
 export interface ResolvedConfig {
     readonly maxRetries: number;
@@ -41,7 +51,12 @@ export interface ResolvedConfig {
     readonly providers: readonly string[];
     readonly excludeProviders: readonly string[];
     readonly respectRetryAfter: boolean;
+    readonly resumeInterrupted: boolean;
+    readonly resumeDisposed: boolean;
+    readonly resumeMaxAgeMs: number;
+    readonly resumePrompt: string;
 }
+export declare const DEFAULT_RESUME_PROMPT = "The previous model request failed and this plugin scheduled a retry, but DeepSeek Harness stopped before that retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.";
 export declare const Config: z<Config>;
 /** Standard DSH retry event shape used by the built-in Web projection and persistence catalog. */
 export type RetryScheduledEventData = Extract<LlmRetryEventData, {
@@ -52,6 +67,10 @@ export interface RetryInternals {
     random?: () => number;
     /** Abort-aware wait override for tests. */
     wait?: (delayMs: number, signal: AbortSignal) => Promise<boolean>;
+    /** Wall-clock override for interrupted-session age checks. */
+    now?: () => number;
+    /** Deferred lifecycle callback override for tests. */
+    defer?: (operation: () => void) => () => void;
 }
 /** Resolve defaults and validate relationships not expressible by the schema. */
 export declare function resolveConfig(config?: Config): ResolvedConfig;
@@ -69,6 +88,20 @@ export declare function isOwnedByProviderPolicy(policy: ResolvedRetryPolicy | un
 export declare function retryDelay(config: ResolvedConfig, attempt: number, failure: LlmFailure, random?: () => number): number | undefined;
 /** Wait without leaving a timer alive after cancellation. */
 export declare function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<boolean>;
-/** Install automatic request-error recovery. Downstream policies get first refusal. */
+export interface PendingRetryContinuation {
+    readonly retryId: RetryId;
+    readonly retry: number;
+    readonly turn: number;
+    readonly step: number;
+    readonly time: number;
+    readonly kind: 'interrupted' | 'disposed';
+}
+/** Find an unmatched retry owned by this plugin in the latest non-terminal turn. */
+export declare function pendingRetryContinuation(events: readonly SessionEvent[], includeDisposed?: boolean): PendingRetryContinuation | undefined;
+/** Stable identity for the one continuation justified by a durable pending retry. */
+export declare function interruptedResumeMessageId(sessionId: SessionId, continuation: Pick<PendingRetryContinuation, 'retryId' | 'retry'>): MessageId;
+/** Queue only a plugin-owned pending retry; existing inbox work is never mutated or duplicated. */
+export declare function resumeInterruptedAgent(agent: Agent, config: ResolvedConfig, now?: number): boolean;
+/** Install automatic request-error recovery and interrupted-session continuation. */
 export declare function apply(ctx: Context, config?: Config, internals?: RetryInternals): void;
 //# sourceMappingURL=index.d.ts.map

@@ -1,32 +1,48 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Session, interruptedTurnClosers } from '@deepseek-ai/dsh-session'
 import {
+  DEFAULT_RESUME_PROMPT,
   RETRY_EVENT,
   RETRY_STARTED_EVENT,
   apply,
+  interruptedResumeMessageId,
   isOverloadFailure,
   isOwnedByProviderPolicy,
   isRetryable,
+  pendingRetryContinuation,
   resolveConfig,
+  resumeInterruptedAgent,
   retryDelay,
   retryLimit,
   retryPolicyKey,
 } from '../dist/index.js'
 
 function createHarness(config = {}, internals = {}) {
-  let listener
   let cleanup
+  const { flush: flushOverride, ...pluginInternals } = internals
   const warnings = []
+  const listeners = new Map()
+  const liveAgents = new Map()
+  const flushes = []
   const ctx = {
     logger: {
       warn: (...args) => warnings.push(args),
     },
+    agents: {
+      get: (id) => liveAgents.get(id),
+    },
+    sessions: {
+      async flush(session) {
+        flushes.push(session)
+        return flushOverride === undefined ? true : flushOverride(session)
+      },
+    },
     on(event, callback) {
-      assert.equal(event, 'agent/request-error')
-      listener = callback
+      listeners.set(event, callback)
       return () => {
-        listener = undefined
+        listeners.delete(event)
       }
     },
     effect(setup) {
@@ -34,14 +50,99 @@ function createHarness(config = {}, internals = {}) {
     },
   }
 
-  apply(ctx, config, internals)
-  assert.equal(typeof listener, 'function')
+  apply(ctx, config, pluginInternals)
+  assert.equal(typeof listeners.get('agent/request-error'), 'function')
+  assert.equal(typeof listeners.get('agent/session-start'), 'function')
 
   return {
     warnings,
-    invoke: (payload, next = async () => undefined) => listener(payload, next),
+    flushes,
+    invoke: (payload, next = async () => undefined) => listeners.get('agent/request-error')(payload, next),
+    start(agent, source = 'resume') {
+      liveAgents.set(agent.id, agent)
+      listeners.get('agent/session-start')({ agent, source })
+    },
     dispose: async () => cleanup?.(),
   }
+}
+
+function event(type, data, seq, time = 1_000) {
+  return { type, data, seq, time }
+}
+
+function pendingRetryEvents({
+  reason = { kind: 'interrupted' },
+  started = false,
+  policyKey = retryPolicyKey(resolveConfig()),
+} = {}) {
+  const retryId = 'retry-1'
+  const events = [
+    event('turn/start', { turn: 1 }, 0),
+    event(RETRY_EVENT, {
+      retryId,
+      turn: 1,
+      step: 1,
+      provider: 'openai',
+      mode: 'normal',
+      policyKey,
+      retry: 1,
+      maxRetries: 2,
+      delayMs: 100,
+      failure: { code: 'PI_AI_ERROR', message: 'internal' },
+    }, 1),
+  ]
+  if (started) {
+    events.push(event(RETRY_STARTED_EVENT, { retryId, turn: 1, step: 1, retry: 1 }, 2))
+  }
+  events.push(event('turn/end', { turn: 1, reason }, events.length))
+  return events
+}
+
+function createResumeAgent({
+  id = 'resume-session',
+  events = pendingRetryEvents(),
+  origin,
+  nextTurn = [],
+  nextStep = [],
+} = {}) {
+  const followed = []
+  const maintenanceCalls = []
+  const turnQueue = [...nextTurn]
+  const stepQueue = [...nextStep]
+  let status = 'idle'
+  let maintenanceActive = false
+  const inbox = {
+    nextTurn: turnQueue,
+    nextStep: stepQueue,
+    get hasPending() {
+      return turnQueue.length > 0 || stepQueue.length > 0
+    },
+  }
+  const agent = {
+    id,
+    get status() {
+      return status
+    },
+    set status(value) {
+      status = value
+    },
+    session: { header: { id, origin }, events },
+    inbox,
+    runMaintenance(task) {
+      if (status !== 'idle' || maintenanceActive) throw new Error('agent already has active work')
+      maintenanceActive = true
+      const controller = new AbortController()
+      maintenanceCalls.push(controller)
+      return Promise.resolve()
+        .then(() => task(controller.signal))
+        .finally(() => { maintenanceActive = false })
+    },
+    followup(message) {
+      followed.push(message)
+      turnQueue.push(message)
+    },
+  }
+  return { agent, followed, maintenanceCalls }
 }
 
 function createPayload(overrides = {}) {
@@ -54,7 +155,7 @@ function createPayload(overrides = {}) {
   }
 
   return {
-    agent: { session },
+    agent: { id: 'retry-session', session },
     turn: 1,
     step: 1,
     provider: 'openai',
@@ -139,7 +240,12 @@ test('provider filters and wildcard codes are respected', () => {
 })
 
 test('backoff is exponential, bounded, and honors Retry-After', () => {
-  const config = resolveConfig({ initialDelayMs: 100, maxDelayMs: 250, jitterRatio: 0.2 })
+  const config = resolveConfig({
+    initialDelayMs: 100,
+    overloadInitialDelayMs: 100,
+    maxDelayMs: 250,
+    jitterRatio: 0.2,
+  })
 
   assert.equal(retryDelay(config, 1, { code: 'SERVER', message: 'down' }, () => 0.5), 100)
   assert.equal(retryDelay(config, 2, { code: 'SERVER', message: 'down' }, () => 0.5), 200)
@@ -152,14 +258,25 @@ test('backoff is exponential, bounded, and honors Retry-After', () => {
     retryDelay(config, 1, { code: 'RATE_LIMIT', message: 'slow', providerRetryAfterMs: 999 }, () => 0),
     undefined,
   )
-  const immediate = resolveConfig({ initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 1 })
+  const immediate = resolveConfig({
+    initialDelayMs: 0,
+    overloadInitialDelayMs: 0,
+    maxDelayMs: 0,
+    jitterRatio: 1,
+  })
   assert.equal(retryDelay(immediate, 10_000, { code: 'UNKNOWN', message: 'retry' }, () => 1), 0)
 })
 
 test('plugin delegates first, records the retry, waits, and returns retry', async () => {
   const waits = []
   const harness = createHarness(
-    { maxRetries: 2, initialDelayMs: 100, maxDelayMs: 100, jitterRatio: 0 },
+    {
+      maxRetries: 2,
+      initialDelayMs: 100,
+      overloadInitialDelayMs: 100,
+      maxDelayMs: 100,
+      jitterRatio: 0,
+    },
     {
       random: () => 0.5,
       wait: async (delayMs, signal) => {
@@ -342,9 +459,221 @@ test('downstream failures propagate without scheduling a retry', async () => {
   await harness.dispose()
 })
 
-test('invalid delay relationships fail during plugin activation', () => {
+test('DSH crash repair recovers only a real plugin-owned pending retry', () => {
+  const session = Session.create('repair-smoke')
+  session.append('turn/start', { turn: 1 })
+  session.append('step/start', { turn: 1, step: 1 })
+  const retry = session.append(RETRY_EVENT, {
+    retryId: 'retry-1',
+    turn: 1,
+    step: 1,
+    provider: 'openai',
+    mode: 'normal',
+    policyKey: retryPolicyKey(resolveConfig()),
+    retry: 1,
+    maxRetries: 2,
+    delayMs: 100,
+    failure: { code: 'PI_AI_ERROR', message: 'internal' },
+  })
+  const repaired = [...session.events, ...interruptedTurnClosers(session.events)]
+
+  assert.deepEqual(pendingRetryContinuation(repaired), {
+    retryId: 'retry-1',
+    retry: 1,
+    turn: 1,
+    step: 1,
+    time: retry.time,
+    kind: 'interrupted',
+  })
+  assert.equal(repaired.at(-2).type, 'step/end')
+  assert.equal(repaired.at(-1).type, 'turn/end')
+})
+
+test('finished, started, foreign, and generic interrupted turns never auto-resume', () => {
+  assert.equal(pendingRetryContinuation(pendingRetryEvents({ reason: { kind: 'completed' } })), undefined)
+  assert.equal(pendingRetryContinuation(pendingRetryEvents({ started: true })), undefined)
+  assert.equal(pendingRetryContinuation(pendingRetryEvents({ policyKey: 'foreign-policy' })), undefined)
+  assert.equal(pendingRetryContinuation([
+    event('turn/start', { turn: 1 }, 0),
+    event('turn/end', { turn: 1, reason: { kind: 'interrupted' } }, 1),
+  ]), undefined)
+})
+
+test('disposed retries require a separate explicit opt-in', () => {
+  const events = pendingRetryEvents({
+    reason: { kind: 'aborted', reason: { kind: 'disposed' } },
+  })
+  assert.equal(pendingRetryContinuation(events), undefined)
+  assert.equal(pendingRetryContinuation(events, true)?.kind, 'disposed')
+})
+
+test('a pending plugin retry gets at most one model-visible continuation', () => {
+  const config = resolveConfig()
+  const { agent, followed } = createResumeAgent()
+  const continuation = pendingRetryContinuation(agent.session.events)
+
+  assert.equal(resumeInterruptedAgent(agent, config, 1_000), true)
+  assert.equal(followed.length, 1)
+  assert.equal(followed[0].id, interruptedResumeMessageId(agent.id, continuation))
+  assert.equal(followed[0].content[0].text, DEFAULT_RESUME_PROMPT)
+  assert.deepEqual(followed[0].source, {
+    kind: 'plugin',
+    plugin: 'deepseek-harness-retry',
+    form: 'notice',
+    summary: 'Continuing pending retry 1 after DSH restart.',
+  })
+
+  // Existing inbox work is a fail-closed fence: never mutate or duplicate it.
+  assert.equal(resumeInterruptedAgent(agent, config, 1_000), false)
+  assert.equal(followed.length, 1)
+  assert.equal(agent.inbox.nextTurn.length, 1)
+})
+
+test('existing durable inbox work is left untouched and never used as a wake hack', () => {
+  const first = { id: 'first', role: 'user', content: [], source: { kind: 'user' } }
+  const second = { id: 'second', role: 'user', content: [], source: { kind: 'user' } }
+  const { agent, followed } = createResumeAgent({ nextTurn: [first, second] })
+
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), false)
+  assert.deepEqual(agent.inbox.nextTurn.map((message) => message.id), ['first', 'second'])
+  assert.equal(followed.length, 0)
+})
+
+test('automatic continuation is bounded by config and excludes subagents', () => {
+  const stale = createResumeAgent()
+  assert.equal(resumeInterruptedAgent(stale.agent, resolveConfig({ resumeMaxAgeMs: 10 }), 1_011), false)
+
+  const disabled = createResumeAgent()
+  assert.equal(resumeInterruptedAgent(disabled.agent, resolveConfig({ resumeInterrupted: false }), 1_000), false)
+
+  const child = createResumeAgent({ origin: 'subagent' })
+  assert.equal(resumeInterruptedAgent(child.agent, resolveConfig(), 1_000), false)
+
+  const disposed = createResumeAgent({
+    events: pendingRetryEvents({ reason: { kind: 'aborted', reason: { kind: 'disposed' } } }),
+  })
+  assert.equal(resumeInterruptedAgent(disposed.agent, resolveConfig(), 1_000), false)
+  assert.equal(resumeInterruptedAgent(disposed.agent, resolveConfig({ resumeDisposed: true }), 1_000), true)
+})
+
+test('session-start continuation is fenced by deferred maintenance and exact liveness', async () => {
+  const deferred = []
+  const harness = createHarness({}, {
+    now: () => 1_000,
+    defer(operation) {
+      const entry = { operation, cancelled: false }
+      deferred.push(entry)
+      return () => { entry.cancelled = true }
+    },
+  })
+  const resumed = createResumeAgent()
+
+  harness.start(resumed.agent, 'startup')
+  assert.equal(deferred.length, 0)
+  harness.start(resumed.agent, 'resume')
+  assert.equal(deferred.length, 1)
+  deferred[0].operation()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(resumed.maintenanceCalls.length, 1)
+  assert.equal(resumed.followed.length, 1)
+  assert.equal(harness.warnings.at(-1)[0], 'deepseek-harness-retry: continuing pending retry in session "%s"')
+
+  const busy = createResumeAgent({ id: 'busy-session' })
+  harness.start(busy.agent, 'resume')
+  busy.agent.status = 'running'
+  deferred[1].operation()
+  await Promise.resolve()
+  assert.equal(busy.maintenanceCalls.length, 0)
+  assert.equal(busy.followed.length, 0)
+  await harness.dispose()
+})
+
+test('plugin disposal cancels deferred interrupted-session continuation', async () => {
+  const deferred = []
+  const harness = createHarness({}, {
+    defer(operation) {
+      const entry = { operation, cancelled: false }
+      deferred.push(entry)
+      return () => { entry.cancelled = true }
+    },
+  })
+  harness.start(createResumeAgent().agent)
+  await harness.dispose()
+  assert.equal(deferred[0].cancelled, true)
+})
+
+test('retry scheduling checkpoints its durable marker for restart recovery', async () => {
+  const harness = createHarness({}, { wait: async () => true })
+  const payload = createPayload()
+  assert.deepEqual(await harness.invoke(payload), { kind: 'retry' })
+  assert.deepEqual(harness.flushes, [payload.agent.session])
+  await harness.dispose()
+})
+
+test('checkpoint failure keeps live retry but explicitly degrades restart recovery', async () => {
+  const unavailable = createHarness({}, {
+    flush: async () => false,
+    wait: async () => true,
+  })
+  assert.deepEqual(await unavailable.invoke(createPayload()), { kind: 'retry' })
+  assert.match(unavailable.warnings[0][0], /restart recovery is best-effort/)
+  await unavailable.dispose()
+
+  const rejected = createHarness({}, {
+    flush: async () => { throw new Error('disk offline') },
+    wait: async () => true,
+  })
+  assert.deepEqual(await rejected.invoke(createPayload()), { kind: 'retry' })
+  assert.match(rejected.warnings[0][0], /restart recovery is best-effort/)
+  assert.equal(rejected.warnings[0][2], 'Error: disk offline')
+  await rejected.dispose()
+})
+
+test('plugin disposal aborts and drains a retry checkpoint already in flight', async () => {
+  let releaseFlush
+  let announceFlush
+  const flushEntered = new Promise((resolve) => { announceFlush = resolve })
+  const flushGate = new Promise((resolve) => { releaseFlush = resolve })
+  let waits = 0
+  const harness = createHarness({}, {
+    flush: async () => {
+      announceFlush()
+      return flushGate
+    },
+    wait: async () => {
+      waits += 1
+      return true
+    },
+  })
+  const pending = harness.invoke(createPayload())
+  await flushEntered
+
+  let disposed = false
+  const disposal = harness.dispose().then(() => { disposed = true })
+  await Promise.resolve()
+  assert.equal(disposed, false)
+
+  releaseFlush(true)
+  await disposal
+  assert.equal(await pending, undefined)
+  assert.equal(waits, 0)
+})
+
+test('invalid config relationships fail during plugin activation', () => {
   assert.throws(
     () => resolveConfig({ initialDelayMs: 1000, maxDelayMs: 100 }),
-    /maxDelayMs must be between initialDelayMs/,
+    /maxDelayMs must be at least both initial delays/,
+  )
+  assert.throws(
+    () => resolveConfig({ overloadInitialDelayMs: 1000, maxDelayMs: 500 }),
+    /maxDelayMs must be at least both initial delays/,
+  )
+  assert.throws(
+    () => resolveConfig({ resumeMaxAgeMs: 1.5 }),
+    /resumeMaxAgeMs must be a non-negative safe integer/,
+  )
+  assert.throws(
+    () => resolveConfig({ resumePrompt: '   ' }),
+    /resumePrompt must not be empty/,
   )
 })
