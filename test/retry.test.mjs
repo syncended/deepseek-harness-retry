@@ -102,6 +102,8 @@ function pendingRetryEvents({
 function incompleteRequestEvents({
   reason = { kind: 'interrupted' },
   assistantMessage = false,
+  assistantToolCall = false,
+  includeToolResult = true,
   interruptedMessage = false,
   includeUser = true,
 } = {}) {
@@ -122,7 +124,7 @@ function incompleteRequestEvents({
     step: 1,
     chunk: { type: 'text-delta', index: 0, text: 'partial' },
   }, events.length))
-  if (assistantMessage) {
+  if (assistantMessage || assistantToolCall) {
     events.push(event('assistant/message', {
       turn: 1,
       step: 1,
@@ -130,9 +132,28 @@ function incompleteRequestEvents({
         id: 'assistant-1',
         role: 'assistant',
         source: { kind: 'model', provider: 'openai', model: 'test' },
-        content: [{ type: 'text', text: 'partial or complete' }],
+        content: assistantToolCall
+          ? [{ type: 'tool-call', id: 'call-1', name: 'bash', arguments: '{}' }]
+          : [{ type: 'text', text: 'partial or complete' }],
       },
       ...(interruptedMessage ? { interrupted: true } : {}),
+    }, events.length))
+  }
+  if (assistantToolCall && includeToolResult) {
+    events.push(event('tool/result', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'tool-result-1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-1' },
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          isError: true,
+          content: [{ type: 'text', text: 'outcome unknown' }],
+        }],
+      },
     }, events.length))
   }
   events.push(event('step/end', { turn: 1, step: 1 }, events.length))
@@ -564,6 +585,28 @@ test('completed and manually interrupted assistant messages never auto-resume', 
   })), undefined)
 })
 
+test('interrupted tool boundary with durable results is proven unfinished', () => {
+  assert.deepEqual(incompleteRequestContinuation(incompleteRequestEvents({
+    assistantToolCall: true,
+  })), {
+    turn: 1,
+    step: 1,
+    time: 1_000,
+    kind: 'interrupted-tool-step',
+  })
+})
+
+test('tool boundary fails closed when any result is missing or the user aborted', () => {
+  assert.equal(incompleteRequestContinuation(incompleteRequestEvents({
+    assistantToolCall: true,
+    includeToolResult: false,
+  })), undefined)
+  assert.equal(incompleteRequestContinuation(incompleteRequestEvents({
+    reason: { kind: 'aborted', reason: { kind: 'user' } },
+    assistantToolCall: true,
+  })), undefined)
+})
+
 test('disposed retries require a separate explicit opt-in', () => {
   const events = pendingRetryEvents({
     reason: { kind: 'aborted', reason: { kind: 'disposed' } },
@@ -604,6 +647,20 @@ test('a crash-interrupted incomplete request gets one continuation', () => {
   assert.equal(
     followed[0].source.summary,
     'Continuing incomplete request from turn 1 after DSH restart.',
+  )
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), false)
+})
+
+test('an interrupted tool boundary gets one safe continuation', () => {
+  const { agent, followed } = createResumeAgent({
+    events: incompleteRequestEvents({ assistantToolCall: true }),
+  })
+
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), true)
+  assert.equal(followed.length, 1)
+  assert.equal(
+    followed[0].source.summary,
+    'Continuing interrupted tool step from turn 1 after DSH restart.',
   )
   assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), false)
 })

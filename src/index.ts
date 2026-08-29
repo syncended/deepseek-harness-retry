@@ -82,7 +82,7 @@ export interface ResolvedConfig {
   readonly resumePrompt: string
 }
 
-export const DEFAULT_RESUME_PROMPT = 'DeepSeek Harness stopped before the previous model request produced a complete assistant message, or before a scheduled retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.'
+export const DEFAULT_RESUME_PROMPT = 'DeepSeek Harness stopped before the previous task produced a complete final assistant response, or before a scheduled retry started. Continue the unfinished work from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.'
 
 export const Config: z<Config> = z.object({
   maxRetries: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(2),
@@ -342,7 +342,7 @@ export interface IncompleteRequestContinuation {
   readonly turn: number
   readonly step: number
   readonly time: number
-  readonly kind: 'incomplete-request'
+  readonly kind: 'incomplete-request' | 'interrupted-tool-step'
 }
 
 export type InterruptedContinuation = PendingRetryContinuation | IncompleteRequestContinuation
@@ -412,9 +412,9 @@ export function pendingRetryContinuation(
 }
 
 /**
- * Find a crash-interrupted model request that never committed an assistant message.
- * A manual interrupt is excluded twice: its turn ends as aborted/user and DSH records
- * a partial assistant/message with interrupted=true.
+ * Find work proven unfinished at a crash boundary: either a model request without an
+ * assistant message, or a tool-calling assistant message whose results were durably
+ * closed before the next model step. Manual interrupts are excluded by aborted/user.
  */
 export function incompleteRequestContinuation(
   events: readonly SessionEvent[],
@@ -445,13 +445,15 @@ export function incompleteRequestContinuation(
 
   let step: number | undefined
   let hasDurableUserInput = false
-  let hasAssistantMessage = false
+  let assistantToolCallIds: readonly string[] | undefined
+  const toolResultCallIds = new Set<string>()
   for (let index = turnStart + 1; index < endIndex; index += 1) {
     const event = events[index]
     if (event.type === 'user/message') hasDurableUserInput = true
     if (event.type === 'step/start' && event.data.turn === turn) {
       step = event.data.step
-      hasAssistantMessage = false
+      assistantToolCallIds = undefined
+      toolResultCallIds.clear()
       continue
     }
     if (
@@ -459,11 +461,30 @@ export function incompleteRequestContinuation(
       && event.type === 'assistant/message'
       && event.data.turn === turn
       && event.data.step === step
-    ) hasAssistantMessage = true
+    ) {
+      assistantToolCallIds = event.data.message.content.flatMap((block) => (
+        block.type === 'tool-call' ? [block.id] : []
+      ))
+      continue
+    }
+    if (
+      step !== undefined
+      && event.type === 'tool/result'
+      && event.data.turn === turn
+      && event.data.step === step
+      && event.data.message.source.kind === 'tool'
+    ) toolResultCallIds.add(event.data.message.source.callId)
   }
 
-  if (step === undefined || !hasDurableUserInput || hasAssistantMessage) return undefined
-  return { turn, step, time, kind: 'incomplete-request' }
+  if (step === undefined || !hasDurableUserInput) return undefined
+  if (assistantToolCallIds === undefined) {
+    return { turn, step, time, kind: 'incomplete-request' }
+  }
+  if (
+    assistantToolCallIds.length > 0
+    && assistantToolCallIds.every((callId) => toolResultCallIds.has(callId))
+  ) return { turn, step, time, kind: 'interrupted-tool-step' }
+  return undefined
 }
 
 /** Stable identity for the one continuation justified by durable interruption evidence. */
@@ -484,7 +505,9 @@ function createInterruptedResumeMessage(
 ) {
   const summary = 'retryId' in continuation
     ? `Continuing pending retry ${continuation.retry} after DSH restart.`
-    : `Continuing incomplete request from turn ${continuation.turn} after DSH restart.`
+    : continuation.kind === 'interrupted-tool-step'
+      ? `Continuing interrupted tool step from turn ${continuation.turn} after DSH restart.`
+      : `Continuing incomplete request from turn ${continuation.turn} after DSH restart.`
   return freezeMessage({
     id: interruptedResumeMessageId(sessionId, continuation),
     role: 'user' as const,

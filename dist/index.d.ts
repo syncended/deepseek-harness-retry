@@ -56,7 +56,7 @@ export interface ResolvedConfig {
     readonly resumeMaxAgeMs: number;
     readonly resumePrompt: string;
 }
-export declare const DEFAULT_RESUME_PROMPT = "DeepSeek Harness stopped before the previous model request produced a complete assistant message, or before a scheduled retry started. Continue the unfinished response from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.";
+export declare const DEFAULT_RESUME_PROMPT = "DeepSeek Harness stopped before the previous task produced a complete final assistant response, or before a scheduled retry started. Continue the unfinished work from the durable session history. Re-check the current workspace and external state before acting. Do not blindly repeat tool calls that may have side effects; verify their outcome first.";
 export declare const Config: z<Config>;
 /** Standard DSH retry event shape used by the built-in Web projection and persistence catalog. */
 export type RetryScheduledEventData = Extract<LlmRetryEventData, {
@@ -100,15 +100,15 @@ export interface IncompleteRequestContinuation {
     readonly turn: number;
     readonly step: number;
     readonly time: number;
-    readonly kind: 'incomplete-request';
+    readonly kind: 'incomplete-request' | 'interrupted-tool-step';
 }
 export type InterruptedContinuation = PendingRetryContinuation | IncompleteRequestContinuation;
 /** Find an unmatched retry owned by this plugin in the latest non-terminal turn. */
 export declare function pendingRetryContinuation(events: readonly SessionEvent[], includeDisposed?: boolean): PendingRetryContinuation | undefined;
 /**
- * Find a crash-interrupted model request that never committed an assistant message.
- * A manual interrupt is excluded twice: its turn ends as aborted/user and DSH records
- * a partial assistant/message with interrupted=true.
+ * Find work proven unfinished at a crash boundary: either a model request without an
+ * assistant message, or a tool-calling assistant message whose results were durably
+ * closed before the next model step. Manual interrupts are excluded by aborted/user.
  */
 export declare function incompleteRequestContinuation(events: readonly SessionEvent[]): IncompleteRequestContinuation | undefined;
 /** Stable identity for the one continuation justified by durable interruption evidence. */
