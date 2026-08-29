@@ -1,6 +1,6 @@
 {
   "name": "@syncended/dsh-retry",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Configurable automatic retries and interrupted-session recovery for DeepSeek Harness",
   "type": "module",
   "main": "dist/index.js",
