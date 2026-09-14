@@ -368,6 +368,38 @@ test('plugin delegates first, records the retry, waits, and returns retry', asyn
   await harness.dispose()
 })
 
+test('snapshot-only sessions retry STREAM_CLOSED with a bounded durable budget', async () => {
+  const harness = createHarness({}, { wait: async () => true })
+  const payload = createPayload({
+    provider: 'deepseek-official',
+    failure: { code: 'STREAM_CLOSED', message: 'SSE stream ended without [DONE]' },
+  })
+  const session = payload.agent.session
+  const events = session.events
+  delete session.events
+  session.snapshotEvents = () => Object.freeze([...events])
+  try {
+    assert.deepEqual(await harness.invoke(payload), { kind: 'retry' })
+    assert.deepEqual(await harness.invoke(payload), { kind: 'retry' })
+    assert.equal(await harness.invoke(payload), undefined)
+    assert.deepEqual(events.filter(e => e.type === RETRY_EVENT).map(e => e.data.retry), [1, 2])
+    assert.equal(events.filter(e => e.type === RETRY_STARTED_EVENT).length, 2)
+    assert.deepEqual(harness.flushes, [session, session])
+  } finally {
+    await harness.dispose()
+  }
+})
+
+test('snapshot-only sessions recover interrupted work once', () => {
+  const { agent, followed } = createResumeAgent()
+  const events = agent.session.events
+  delete agent.session.events
+  agent.session.snapshotEvents = () => Object.freeze([...events])
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), true)
+  assert.equal(resumeInterruptedAgent(agent, resolveConfig(), 1_000), false)
+  assert.equal(followed.length, 1)
+})
+
 test('plugin preserves a downstream recovery decision without adding a retry', async () => {
   let waited = false
   const harness = createHarness({}, {

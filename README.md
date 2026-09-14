@@ -26,6 +26,8 @@ Retry errors and delays are not added to model-visible history. Every retry is a
 - The built-in `@deepseek-ai/dsh-llm-retry` plugin. Do not remove it; this plugin extends rather than replaces its policies.
 - pnpm/Corepack only when developing from source.
 
+Version `0.2.3` supports DSH `0.1.5-rc.2` session snapshots while retaining support for the older session event API. Upgrade from `0.2.2` if retryable errors end with `Cannot read properties of undefined (reading 'length')` instead of scheduling a retry.
+
 This is a Host plugin. It has no browser connection step and requires no plugin-specific environment variables.
 
 ## Install

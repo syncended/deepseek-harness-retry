@@ -306,6 +306,16 @@ export function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<
   })
 }
 
+/** DSH 0.1.5 exposes immutable snapshots instead of the former events property. */
+function sessionEvents(session: {
+  snapshotEvents?: () => readonly SessionEvent[]
+  events?: readonly SessionEvent[]
+}): readonly SessionEvent[] {
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  if (session.events !== undefined) return session.events
+  throw new Error('deepseek-harness-retry: session has no supported event reader')
+}
+
 function previousRetry(
   events: readonly { type: string; data: unknown }[],
   turn: number,
@@ -532,8 +542,9 @@ export function resumeInterruptedAgent(
     || agent.session.header.origin === 'subagent'
     || agent.inbox.hasPending
   ) return false
-  const continuation = pendingRetryContinuation(agent.session.events, config.resumeDisposed)
-    ?? incompleteRequestContinuation(agent.session.events)
+  const events = sessionEvents(agent.session)
+  const continuation = pendingRetryContinuation(events, config.resumeDisposed)
+    ?? incompleteRequestContinuation(events)
   if (continuation === undefined) return false
   if (now - continuation.time > config.resumeMaxAgeMs) return false
   agent.followup(createInterruptedResumeMessage(agent.id, continuation, config.resumePrompt))
@@ -583,7 +594,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
       if (!isRetryable(resolved, payload.provider, payload.failure)) return undefined
 
       const previous = previousRetry(
-        payload.agent.session.events,
+        sessionEvents(payload.agent.session),
         payload.turn,
         payload.step,
         payload.provider,

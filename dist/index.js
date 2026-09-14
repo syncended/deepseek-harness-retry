@@ -193,6 +193,14 @@ export function cancellableDelay(delayMs, signal) {
         signal.addEventListener('abort', onAbort, { once: true });
     });
 }
+/** DSH 0.1.5 exposes immutable snapshots instead of the former events property. */
+function sessionEvents(session) {
+    if (typeof session.snapshotEvents === 'function')
+        return session.snapshotEvents();
+    if (session.events !== undefined)
+        return session.events;
+    throw new Error('deepseek-harness-retry: session has no supported event reader');
+}
 function previousRetry(events, turn, step, provider, policyKey) {
     for (let index = events.length - 1; index >= 0; index -= 1) {
         const event = events[index];
@@ -374,8 +382,9 @@ export function resumeInterruptedAgent(agent, config, now = Date.now()) {
         || agent.session.header.origin === 'subagent'
         || agent.inbox.hasPending)
         return false;
-    const continuation = pendingRetryContinuation(agent.session.events, config.resumeDisposed)
-        ?? incompleteRequestContinuation(agent.session.events);
+    const events = sessionEvents(agent.session);
+    const continuation = pendingRetryContinuation(events, config.resumeDisposed)
+        ?? incompleteRequestContinuation(events);
     if (continuation === undefined)
         return false;
     if (now - continuation.time > config.resumeMaxAgeMs)
@@ -414,7 +423,7 @@ export function apply(ctx, config = {}, internals = {}) {
                 return undefined;
             if (!isRetryable(resolved, payload.provider, payload.failure))
                 return undefined;
-            const previous = previousRetry(payload.agent.session.events, payload.turn, payload.step, payload.provider, policyKey);
+            const previous = previousRetry(sessionEvents(payload.agent.session), payload.turn, payload.step, payload.provider, policyKey);
             const attempt = (previous?.retry ?? 0) + 1;
             const maxRetries = retryLimit(resolved, payload.failure);
             if (attempt > maxRetries)
